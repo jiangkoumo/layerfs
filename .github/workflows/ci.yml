@@ -125,8 +125,10 @@ jobs:
           cargo +"$RUST_TOOLCHAIN" test --manifest-path core/Cargo.toml --locked \
             --workspace --exclude layerfs-daemon --all-targets --no-run
       - name: Run tests
-        # Measured ~62 s on 4 cores. The step limit is a hang guard, not a target.
-        timeout-minutes: 8
+        # Measured 62-66 s on 4 cores (285 test binaries, longest 11 s), so the
+        # whole run fits AGENTS.md's 2-minute test ceiling. The step limit is a
+        # hang guard with headroom for a slower runner, not a target.
+        timeout-minutes: 5
         run: |
           cargo +"$RUST_TOOLCHAIN" test --manifest-path core/Cargo.toml --locked \
             --workspace --exclude layerfs-daemon --all-targets --no-fail-fast
