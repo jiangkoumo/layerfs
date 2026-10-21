@@ -1,0 +1,72 @@
+# LayerFS privileged tests — layerfs-daemon integration tests that mount FUSE
+# directly (mount(2), needs root) and some that remount the container's own
+# cgroup or require that fusectl is NOT mounted. They are written to run inside
+# a --privileged container, so that is what this job does.
+#
+# NEVER a required check. Runs nightly on main and on demand
+# (Actions tab -> "privileged" -> Run workflow, pick any branch).
+# A red run here is information, not a merge blocker.
+
+name: privileged
+
+on:
+  schedule:
+    - cron: "17 19 * * *"   # 03:17 Asia/Shanghai, daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: privileged-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: "1.85.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  daemon-mounted:
+    name: layerfs-daemon integration tests (privileged container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+          save-if: false   # reuse ci.yml's main cache; never write
+      - name: Build daemon test binaries
+        run: |
+          cargo +"$RUST_TOOLCHAIN" test --manifest-path core/Cargo.toml --locked \
+            -p layerfs-daemon --tests --no-run --message-format=json \
+          | python3 -c 'import json,sys
+          for l in sys.stdin:
+              d = json.loads(l)
+              if d.get("reason") == "compiler-artifact" and d.get("executable") and d["target"]["kind"] == ["test"]:
+                  print(d["executable"])' > daemon-tests.txt
+          wc -l daemon-tests.txt
+      - name: Run each test binary as root in a --privileged container
+        # Same glibc as the runner (ubuntu:24.04). Source and target are mounted
+        # read-only at their real paths, so compile-time paths still resolve.
+        # Each binary gets the repository's 120 s test ceiling.
+        run: |
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
+            -w "$GITHUB_WORKSPACE/core/crates/layerfs-daemon" \
+            ubuntu:24.04 bash -c '
+              apt-get update -qq >/dev/null && apt-get install -y -qq python3 perl >/dev/null
+              failed=()
+              for b in $(cat '"$GITHUB_WORKSPACE"'/daemon-tests.txt); do
+                n=$(basename "$b"); echo "::group::$n"
+                timeout 120 "$b" || failed+=("$n")
+                echo "::endgroup::"
+              done
+              echo "failed binaries: ${failed[*]:-none}"
+              [ ${#failed[@]} -eq 0 ]'

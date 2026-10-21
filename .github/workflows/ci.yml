@@ -1,0 +1,217 @@
+# LayerFS CI — fast, path-filtered checks for pull requests and main.
+#
+# Branch protection should require ONE check only: "ci-ok".
+# Jobs a PR does not touch are skipped, and a skipped job counts as passing.
+# Privileged FUSE/mount tests are NOT here; see privileged.yml (nightly/manual,
+# never required).
+#
+# Roll back: delete this file (or disable the workflow in the Actions tab) and
+# un-require "ci-ok" in branch protection. Nothing else depends on it.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR/branch cancels the older run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # One pinned toolchain = the MSRV in core/Cargo.toml (rust-version 1.85) and
+  # the version core/AGENTS.md uses for test, clippy AND fmt. A new Rust
+  # release can therefore never turn CI red on its own. Bump deliberately.
+  RUST_TOOLCHAIN: "1.85.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # No debuginfo: about half the target size, faster links, smaller cache.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      sdk_js: ${{ steps.filter.outputs.sdk_js }}
+      dsh: ${{ steps.filter.outputs.dsh }}
+      tools: ${{ steps.filter.outputs.tools }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'core/Cargo.toml'
+              - 'core/Cargo.lock'
+              - 'core/crates/**'
+              - 'core/vendor/**'
+              - 'core/patches/**'
+              - 'sdk/js/native/**'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+            sdk_js:
+              - 'sdk/js/**'
+              - '.github/workflows/ci.yml'
+            dsh:
+              - 'dsh/**'
+              - 'sdk/js/**'
+              - 'core/docs/issues/**'
+              - '.github/workflows/ci.yml'
+            tools:
+              - 'tools/**'
+              - 'core/tools/**'
+              - 'core/crates/**'
+              - 'core/Cargo.toml'
+              - '.github/workflows/ci.yml'
+
+  rust-lint:
+    name: rust fmt + clippy
+    needs: changes
+    # Pushes to main and manual runs check everything; PRs only what they touch.
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+          # Only main writes the cache, so PRs cannot evict each other.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: rustfmt
+        run: cargo +"$RUST_TOOLCHAIN" fmt --manifest-path core/Cargo.toml --all -- --check
+      - name: clippy (-D warnings)
+        if: ${{ !cancelled() }}   # still lint when fmt failed, so one run shows both
+        run: cargo +"$RUST_TOOLCHAIN" clippy --manifest-path core/Cargo.toml --locked --all-targets -- -D warnings
+
+  rust-test:
+    name: rust tests (unprivileged)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # layerfs-daemon's integration tests mount FUSE as root, so they run in
+      # privileged.yml instead. They are still type-checked here by rust-lint
+      # (clippy --all-targets), so a PR cannot break their compilation silently.
+      # Build and run use the same package selection so Cargo's feature
+      # unification is identical and nothing is compiled twice.
+      - name: Build tests (all packages except layerfs-daemon integration tests)
+        run: |
+          cargo +"$RUST_TOOLCHAIN" test --manifest-path core/Cargo.toml --locked \
+            --workspace --exclude layerfs-daemon --all-targets --no-run
+      - name: Run tests
+        # Measured 62-66 s on 4 cores (285 test binaries, longest 11 s), so the
+        # whole run fits AGENTS.md's 2-minute test ceiling. The step limit is a
+        # hang guard with headroom for a slower runner, not a target.
+        timeout-minutes: 5
+        run: |
+          cargo +"$RUST_TOOLCHAIN" test --manifest-path core/Cargo.toml --locked \
+            --workspace --exclude layerfs-daemon --all-targets --no-fail-fast
+
+  python-tools:
+    name: python tools + boundary guard
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tools == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: core/tools unit tests
+        run: python3 -B -m unittest discover -s core/tools -p 'test_*.py'
+      - name: tools unit tests
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py'
+      - name: product boundary guard
+        # ADVISORY until the guard's rules match the current architecture
+        # (on main 5fb68ddc1 it reports 60 findings). Delete this line to make
+        # it blocking.
+        continue-on-error: true
+        run: python3 -B core/tools/check_product_boundary.py
+
+  sdk-js:
+    name: sdk/js (stand-in binding, no Docker)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.sdk_js == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax check
+        run: for f in $(git ls-files 'sdk/js/*.js' 'sdk/js/*.mjs' 'sdk/js/*.cjs'); do node --check "$f"; done
+      - name: Stand-in binding tests
+        working-directory: sdk/js
+        run: |
+          node test/exec_output.mjs
+          for c in on off failure dsh-env start ids no-content store daemon-host; do
+            node test/trace.mjs "$c"
+          done
+          node test/packaging.mjs lazy
+
+  dsh:
+    name: dsh tests (advisory, not part of ci-ok yet)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.dsh == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install (workspace links only; no registry packages; lockfile frozen)
+        working-directory: dsh
+        run: pnpm install --frozen-lockfile
+      - name: npm test
+        working-directory: dsh
+        run: |
+          command -v sqlite3 >/dev/null || sudo apt-get install -y sqlite3   # one test shells out to sqlite3
+          npm test
+
+  # The single check to mark "required" in branch protection.
+  # dsh is deliberately NOT listed yet: on main 5fb68ddc1 one dsh test
+  # (tools/history/tests/p2.mjs "closure (INSTALLS)") depends on pnpm store
+  # internals and failed on our test host. Add "dsh" here once it is green.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, rust-lint, rust-test, python-tools, sdk-js]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: All selected jobs passed or were skipped
+        run: |
+          echo '${{ toJSON(needs) }}' | python3 -c '
+          import json, sys
+          bad = {k: v["result"] for k, v in json.load(sys.stdin).items()
+                 if v["result"] not in ("success", "skipped")}
+          print("failed:", bad or "none"); sys.exit(1 if bad else 0)'
